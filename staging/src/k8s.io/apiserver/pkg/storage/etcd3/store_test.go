@@ -1036,7 +1036,7 @@ func TestGuaranteedUpdateWithSuggestionAndConflict(t *testing.T) {
 func TestTransformationFailure(t *testing.T) {
 	client := testserver.RunEtcd(t, nil)
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
-	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, false, NewDefaultLeaseManagerConfig())
+	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, false, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 
 	preset := []struct {
@@ -1115,8 +1115,8 @@ func TestList(t *testing.T) {
 	client := testserver.RunEtcd(t, nil)
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RemainingItemCount, true)()
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
-	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, NewDefaultLeaseManagerConfig())
-	disablePagingStore := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, false, NewDefaultLeaseManagerConfig())
+	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
+	disablePagingStore := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, false, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 
 	// Setup storage with the following structure:
@@ -1625,13 +1625,89 @@ func TestList(t *testing.T) {
 	}
 }
 
+func TestListPaginationWithEnforcedLimit(t *testing.T) {
+	etcdClient := testserver.RunEtcd(t, nil)
+	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
+	transformer := &prefixTransformer{prefix: []byte(defaultTestPrefix)}
+	recorder := &clientRecorder{KV: etcdClient.KV}
+	etcdClient.KV = recorder
+	store := newStore(etcdClient, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
+	ctx := context.Background()
+
+	podCount := 1000
+	var pods []*example.Pod
+	for i := 0; i < podCount; i++ {
+		key := fmt.Sprintf("/one-level/pod-%d", i)
+		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod-%d", i)}}
+		storedObj := &example.Pod{}
+		err := store.Create(ctx, key, obj, storedObj, 0)
+		if err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
+		pods = append(pods, storedObj)
+	}
+
+	options := storage.ListOptions{
+		ResourceVersion: "0",
+		Predicate: storage.SelectionPredicate{
+			Limit: 100,
+			Label: labels.Everything(),
+			Field: fields.OneTermEqualSelector("metadata.name", "pod-999"),
+			GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+				pod := obj.(*example.Pod)
+				return nil, fields.Set{"metadata.name": pod.Name}, nil
+			},
+		},
+		Recursive: true,
+	}
+
+	testCases := []struct{
+		limit int
+		pages int
+	}{
+		{
+			limit: 1,
+			pages: 1000,
+		},
+		{
+			limit: 20,
+			pages: 50,
+		},
+		{
+			limit: 500,
+			pages: 10,
+		},
+	}
+	for _, tc := range testCases {
+		store.maximumListLimit = tc.limit
+		out := &example.PodList{}
+		if err := store.List(ctx, "/", options, out); err != nil {
+			t.Fatalf("Unable to get initial list: %v", err)
+		}
+		if len(out.Continue) != 0 {
+			t.Errorf("Unexpected continuation token set")
+		}
+		if len(out.Items) != 1 || !reflect.DeepEqual(&out.Items[0], pods[999]) {
+			t.Fatalf("Unexpected first page: %#v", out.Items)
+		}
+		if transformer.reads != uint64(podCount) {
+			t.Errorf("unexpected reads: %d", transformer.reads)
+		}
+		if int(recorder.reads) != tc.pages {
+			t.Errorf("expect reads: %d, but got %d", tc.pages, recorder.reads)
+		}
+		transformer.resetReads()
+		recorder.resetReads()
+	}
+}
+
 func TestListContinuation(t *testing.T) {
 	etcdClient := testserver.RunEtcd(t, nil)
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	transformer := &prefixTransformer{prefix: []byte(defaultTestPrefix)}
 	recorder := &clientRecorder{KV: etcdClient.KV}
 	etcdClient.KV = recorder
-	store := newStore(etcdClient, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig())
+	store := newStore(etcdClient, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 
 	// Setup storage with the following structure:
@@ -1807,7 +1883,7 @@ func TestListContinuationWithFilter(t *testing.T) {
 	transformer := &prefixTransformer{prefix: []byte(defaultTestPrefix)}
 	recorder := &clientRecorder{KV: etcdClient.KV}
 	etcdClient.KV = recorder
-	store := newStore(etcdClient, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig())
+	store := newStore(etcdClient, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 
 	preset := []struct {
@@ -1917,7 +1993,7 @@ func TestListContinuationWithFilter(t *testing.T) {
 func TestListInconsistentContinuation(t *testing.T) {
 	client := testserver.RunEtcd(t, nil)
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
-	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, NewDefaultLeaseManagerConfig())
+	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 
 	// Setup storage with the following structure:
@@ -2084,7 +2160,7 @@ func testSetup(t *testing.T) (context.Context, *store, *clientv3.Client) {
 	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, LeaseManagerConfig{
 		ReuseDurationSeconds: 1,
 		MaxObjectCount:       defaultLeaseMaxObjectCount,
-	})
+	}, DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 	return ctx, store, client
 }
@@ -2125,7 +2201,7 @@ func TestPrefix(t *testing.T) {
 		"/registry":         "/registry",
 	}
 	for configuredPrefix, effectivePrefix := range testcases {
-		store := newStore(client, codec, nil, configuredPrefix, schema.GroupResource{Resource: "widgets"}, transformer, true, NewDefaultLeaseManagerConfig())
+		store := newStore(client, codec, nil, configuredPrefix, schema.GroupResource{Resource: "widgets"}, transformer, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 		if store.pathPrefix != effectivePrefix {
 			t.Errorf("configured prefix of %s, expected effective prefix of %s, got %s", configuredPrefix, effectivePrefix, store.pathPrefix)
 		}
@@ -2291,7 +2367,7 @@ func TestConsistentList(t *testing.T) {
 	transformer := &fancyTransformer{
 		transformer: &prefixTransformer{prefix: []byte(defaultTestPrefix)},
 	}
-	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig())
+	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, transformer, true, NewDefaultLeaseManagerConfig(), DefaultMaximumListEtcdLimit)
 	transformer.store = store
 
 	for i := 0; i < 5; i++ {
@@ -2401,7 +2477,7 @@ func TestLeaseMaxObjectCount(t *testing.T) {
 	store := newStore(client, codec, newPod, "", schema.GroupResource{Resource: "pods"}, &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, LeaseManagerConfig{
 		ReuseDurationSeconds: defaultLeaseReuseDurationSeconds,
 		MaxObjectCount:       2,
-	})
+	}, DefaultMaximumListEtcdLimit)
 	ctx := context.Background()
 
 	obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo"}}

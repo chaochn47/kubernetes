@@ -49,6 +49,8 @@ import (
 	utiltrace "k8s.io/utils/trace"
 )
 
+const DefaultMaximumListEtcdLimit = 500
+
 // authenticatedDataString satisfies the value.Context interface. It uses the key to
 // authenticate the stored data. This does not defend against reuse of previously
 // encrypted values under the same key, but will prevent an attacker from using an
@@ -75,6 +77,7 @@ type store struct {
 	groupResourceString string
 	watcher             *watcher
 	pagingEnabled       bool
+	maximumListLimit    int
 	leaseManager        *leaseManager
 }
 
@@ -87,11 +90,11 @@ type objState struct {
 }
 
 // New returns an etcd3 implementation of storage.Interface.
-func New(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, groupResource schema.GroupResource, transformer value.Transformer, pagingEnabled bool, leaseManagerConfig LeaseManagerConfig) storage.Interface {
-	return newStore(c, codec, newFunc, prefix, groupResource, transformer, pagingEnabled, leaseManagerConfig)
+func New(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, groupResource schema.GroupResource, transformer value.Transformer, pagingEnabled bool, leaseManagerConfig LeaseManagerConfig, maximumListEtcdLimit int) storage.Interface {
+	return newStore(c, codec, newFunc, prefix, groupResource, transformer, pagingEnabled, leaseManagerConfig, maximumListEtcdLimit)
 }
 
-func newStore(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, groupResource schema.GroupResource, transformer value.Transformer, pagingEnabled bool, leaseManagerConfig LeaseManagerConfig) *store {
+func newStore(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, groupResource schema.GroupResource, transformer value.Transformer, pagingEnabled bool, leaseManagerConfig LeaseManagerConfig, maximumListEtcdLimit int) *store {
 	versioner := APIObjectVersioner{}
 	result := &store{
 		client:        c,
@@ -107,6 +110,7 @@ func newStore(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Ob
 		groupResourceString: groupResource.String(),
 		watcher:             newWatcher(c, codec, newFunc, versioner, transformer),
 		leaseManager:        newDefaultLeaseManager(c, leaseManagerConfig),
+		maximumListLimit:    maximumListEtcdLimit,
 	}
 	return result
 }
@@ -574,11 +578,10 @@ type clientPagingConfig struct {
 func (s *store) paginatedList(ctx context.Context, key, end string, rev int64, fromRev *uint64,
 	v reflect.Value, typeName string, pred storage.SelectionPredicate, newItemFunc func() runtime.Object) (pcfg *clientPagingConfig, err error) {
 	pcfg = &clientPagingConfig{}
-	maximumLimit := int64(500)
+	maximumLimit := int64(s.maximumListLimit)
 	if !s.pagingEnabled || pred.Limit <= 0 {
 		pred.Limit = math.MaxInt64
 	}
-	remainingLimit := pred.Limit
 
 	// loop until we have filled the requested limit from etcd or there are no more results
 	var lastKey []byte
@@ -593,9 +596,9 @@ func (s *store) paginatedList(ctx context.Context, key, end string, rev int64, f
 		metrics.RecordStorageListMetrics(s.groupResourceString, numFetched, numEvald, numReturn)
 	}()
 	for {
-		limit := maximumLimit
-		if remainingLimit < limit {
-			limit = remainingLimit
+		limit := pred.Limit - int64(v.Len())
+		if maximumLimit < limit {
+			limit = maximumLimit
 		}
 		opts := []clientv3.OpOption{clientv3.WithRange(end), clientv3.WithRev(rev), clientv3.WithLimit(limit)}
 		startTime := time.Now()
@@ -667,7 +670,6 @@ func (s *store) paginatedList(ctx context.Context, key, end string, rev int64, f
 			break
 		}
 		key = string(lastKey) + "\x00"
-		remainingLimit = remainingLimit - limit
 	}
 	pcfg.hasMore = hasMore
 	pcfg.resourceVersion = rev
