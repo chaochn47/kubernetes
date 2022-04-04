@@ -254,7 +254,8 @@ func newETCD3Storage(c storagebackend.Config, newFunc func() runtime.Object) (st
 	if transformer == nil {
 		transformer = value.IdentityTransformer
 	}
-	return etcd3.New(client, c.Codec, newFunc, c.Prefix, transformer, c.Paging, c.LeaseManagerConfig), destroyFunc, nil
+	pagingConfig := etcd3.PagingConfig{PagingEnabled: c.Paging, MaximumPageSize: c.MaximumPageSize}
+	return etcd3.New(client, c.Codec, newFunc, c.Prefix, transformer, c.LeaseManagerConfig, pagingConfig), destroyFunc, nil
 }
 
 // startDBSizeMonitorPerEndpoint starts a loop to monitor etcd database size and update the

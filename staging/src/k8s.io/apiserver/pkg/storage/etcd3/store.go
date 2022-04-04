@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path"
 	"reflect"
 	"strings"
@@ -64,14 +65,20 @@ func (d authenticatedDataString) AuthenticatedData() []byte {
 var _ value.Context = authenticatedDataString("")
 
 type store struct {
-	client        *clientv3.Client
-	codec         runtime.Codec
-	versioner     storage.Versioner
-	transformer   value.Transformer
-	pathPrefix    string
-	watcher       *watcher
-	pagingEnabled bool
-	leaseManager  *leaseManager
+	client       *clientv3.Client
+	codec        runtime.Codec
+	versioner    storage.Versioner
+	transformer  value.Transformer
+	pathPrefix   string
+	watcher      *watcher
+	leaseManager *leaseManager
+
+	pagingConfig PagingConfig
+}
+
+type PagingConfig struct {
+	PagingEnabled   bool
+	MaximumPageSize int
 }
 
 type objState struct {
@@ -83,23 +90,23 @@ type objState struct {
 }
 
 // New returns an etcd3 implementation of storage.Interface.
-func New(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, transformer value.Transformer, pagingEnabled bool, leaseManagerConfig LeaseManagerConfig) storage.Interface {
-	return newStore(c, codec, newFunc, prefix, transformer, pagingEnabled, leaseManagerConfig)
+func New(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig, pagingConfig PagingConfig) storage.Interface {
+	return newStore(c, codec, newFunc, prefix, transformer, leaseManagerConfig, pagingConfig)
 }
 
-func newStore(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, transformer value.Transformer, pagingEnabled bool, leaseManagerConfig LeaseManagerConfig) *store {
+func newStore(c *clientv3.Client, codec runtime.Codec, newFunc func() runtime.Object, prefix string, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig, pagingConfig PagingConfig) *store {
 	versioner := APIObjectVersioner{}
 	result := &store{
-		client:        c,
-		codec:         codec,
-		versioner:     versioner,
-		transformer:   transformer,
-		pagingEnabled: pagingEnabled,
+		client:      c,
+		codec:       codec,
+		versioner:   versioner,
+		transformer: transformer,
 		// for compatibility with etcd2 impl.
 		// no-op for default prefix of '/registry'.
 		// keeps compatibility with etcd2 impl for custom prefixes that don't start with '/'
 		pathPrefix:   path.Join("/", prefix),
 		watcher:      newWatcher(c, codec, newFunc, versioner, transformer),
+		pagingConfig: pagingConfig,
 		leaseManager: newDefaultLeaseManager(c, leaseManagerConfig),
 	}
 	return result
@@ -603,6 +610,108 @@ func encodeContinue(key, keyPrefix string, resourceVersion int64) (string, error
 	return base64.RawURLEncoding.EncodeToString(out), nil
 }
 
+func (s *store) paginatedList(ctx context.Context, trace *utiltrace.Trace, key, end string, rev int64, fromRev *uint64,
+	v reflect.Value, typeName string, pred storage.SelectionPredicate, newItemFunc func() runtime.Object) (hasMore bool, startKey string, resourceVersion, remainingCnt int64, err error) {
+	maximumLimit := int64(s.pagingConfig.MaximumPageSize)
+	if maximumLimit <= 0 {
+		maximumLimit = math.MaxInt64
+	}
+	if !s.pagingConfig.PagingEnabled || pred.Limit <= 0 {
+		pred.Limit = math.MaxInt64
+	}
+
+	// loop until we have filled the requested limit from etcd or there are no more results
+	var lastKey []byte
+	var getResp *clientv3.GetResponse
+	var pages float64
+	start := time.Now()
+	defer func() {
+		if err == nil {
+			// quantify the list from storage latency
+			metrics.RecordListStorageLatency(typeName, start)
+		}
+		// only log number of pages if the request is slow >= 500ms
+		trace.Step("fetched all pages from etcd", utiltrace.Field{Key: "page-count", Value: pages})
+	}()
+	for {
+		limit := pred.Limit - int64(v.Len())
+		if maximumLimit < limit {
+			limit = maximumLimit
+		}
+
+		opts := []clientv3.OpOption{clientv3.WithRange(end), clientv3.WithRev(rev), clientv3.WithLimit(limit)}
+		startTime := time.Now()
+		getResp, err = s.client.KV.Get(ctx, key, opts...)
+		if len(end) == 0 {
+			metrics.RecordEtcdRequestLatency("get", typeName, startTime)
+		} else {
+			metrics.RecordEtcdRequestLatency("list", typeName, startTime)
+		}
+		if err != nil {
+			return false, "", 0, 0, err
+		}
+
+		pages++
+		// check ResourceVersionMatchNotOlderThan
+		if fromRev != nil && *fromRev > uint64(getResp.Header.Revision) {
+			return false, "", 0, 0, storage.NewTooLargeResourceVersionError(uint64(rev), uint64(getResp.Header.Revision), 0)
+		}
+		hasMore = getResp.More
+
+		if len(getResp.Kvs) == 0 && getResp.More {
+			return false, "", 0, 0, fmt.Errorf("no results were found, but etcd indicated there were more values remaining")
+		}
+
+		// set up remainingCnt and resourceVersion when the first query returns
+		if remainingCnt == 0 && getResp.Count-pred.Limit > 0 {
+			remainingCnt = getResp.Count - pred.Limit
+		}
+		if rev == 0 {
+			rev = getResp.Header.Revision
+		}
+
+		// avoid small allocations for the result slice, since this can be called in many
+		// different contexts and we don't know how significantly the result will be filtered
+		if pred.Empty() {
+			growSlice(v, len(getResp.Kvs))
+		} else {
+			growSlice(v, 2048, len(getResp.Kvs))
+		}
+
+		// take items from the response until the bucket is full, filtering as we go
+		for i, kv := range getResp.Kvs {
+			if int64(v.Len()) >= pred.Limit {
+				hasMore = true
+				break
+			}
+			lastKey = kv.Key
+
+			data, _, err := s.transformer.TransformFromStorage(kv.Value, authenticatedDataString(kv.Key))
+			if err != nil {
+				return false, "", 0, 0, storage.NewInternalErrorf("unable to transform key %q: %v", kv.Key, err)
+			}
+
+			if err := appendListItem(v, data, uint64(kv.ModRevision), pred, s.codec, s.versioner, newItemFunc); err != nil {
+				return false, "", 0, 0, err
+			}
+
+			// free kv early. Long lists can take O(seconds) to decode.
+			getResp.Kvs[i] = nil
+		}
+
+		// no more results remain
+		if !hasMore {
+			break
+		}
+		// we have filled our bucket
+		if int64(v.Len()) >= pred.Limit {
+			break
+		}
+		key = string(lastKey) + "\x00"
+	}
+	return hasMore, string(lastKey) + "\x00", rev, remainingCnt, err
+}
+
 // List implements storage.Interface.List.
 func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
 	resourceVersion := opts.ResourceVersion
@@ -635,14 +744,6 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 	}
 	keyPrefix := key
 
-	// set the appropriate clientv3 options to filter the returned data set
-	var paging bool
-	options := make([]clientv3.OpOption, 0, 4)
-	if s.pagingEnabled && pred.Limit > 0 {
-		paging = true
-		options = append(options, clientv3.WithLimit(pred.Limit))
-	}
-
 	newItemFunc := getNewItemFunc(listObj, v)
 
 	var fromRV *uint64
@@ -654,10 +755,10 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 		fromRV = &parsedRV
 	}
 
-	var returnedRV, continueRV, withRev int64
-	var continueKey string
+	var continueRV, withRev int64
+	var continueKey, rangeEnd string
 	switch {
-	case s.pagingEnabled && len(pred.Continue) > 0:
+	case s.pagingConfig.PagingEnabled && len(pred.Continue) > 0:
 		continueKey, continueRV, err = decodeContinue(pred.Continue, keyPrefix)
 		if err != nil {
 			return apierrors.NewBadRequest(fmt.Sprintf("invalid continue token: %v", err))
@@ -667,8 +768,7 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 			return apierrors.NewBadRequest("specifying resource version is not allowed when using continue")
 		}
 
-		rangeEnd := clientv3.GetPrefixRangeEnd(keyPrefix)
-		options = append(options, clientv3.WithRange(rangeEnd))
+		rangeEnd = clientv3.GetPrefixRangeEnd(keyPrefix)
 		key = continueKey
 
 		// If continueRV > 0, the LIST request needs a specific resource version.
@@ -676,29 +776,25 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 		// If continueRV < 0, the request is for the latest resource version.
 		if continueRV > 0 {
 			withRev = continueRV
-			returnedRV = continueRV
 		}
-	case s.pagingEnabled && pred.Limit > 0:
+	case s.pagingConfig.PagingEnabled && pred.Limit > 0:
 		if fromRV != nil {
 			switch match {
 			case metav1.ResourceVersionMatchNotOlderThan:
 				// The not older than constraint is checked after we get a response from etcd,
 				// and returnedRV is then set to the revision we get from the etcd response.
 			case metav1.ResourceVersionMatchExact:
-				returnedRV = int64(*fromRV)
-				withRev = returnedRV
+				withRev = int64(*fromRV)
 			case "": // legacy case
 				if *fromRV > 0 {
-					returnedRV = int64(*fromRV)
-					withRev = returnedRV
+					withRev = int64(*fromRV)
 				}
 			default:
 				return fmt.Errorf("unknown ResourceVersionMatch value: %v", match)
 			}
 		}
 
-		rangeEnd := clientv3.GetPrefixRangeEnd(keyPrefix)
-		options = append(options, clientv3.WithRange(rangeEnd))
+		rangeEnd = clientv3.GetPrefixRangeEnd(keyPrefix)
 	default:
 		if fromRV != nil {
 			switch match {
@@ -706,91 +802,26 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 				// The not older than constraint is checked after we get a response from etcd,
 				// and returnedRV is then set to the revision we get from the etcd response.
 			case metav1.ResourceVersionMatchExact:
-				returnedRV = int64(*fromRV)
-				withRev = returnedRV
+				withRev = int64(*fromRV)
 			case "": // legacy case
 			default:
 				return fmt.Errorf("unknown ResourceVersionMatch value: %v", match)
 			}
 		}
 
-		options = append(options, clientv3.WithPrefix())
-	}
-	if withRev != 0 {
-		options = append(options, clientv3.WithRev(withRev))
+		rangeEnd = clientv3.GetPrefixRangeEnd(key)
 	}
 
-	// loop until we have filled the requested limit from etcd or there are no more results
-	var lastKey []byte
-	var hasMore bool
-	var getResp *clientv3.GetResponse
-	for {
-		startTime := time.Now()
-		getResp, err = s.client.KV.Get(ctx, key, options...)
-		metrics.RecordEtcdRequestLatency("list", getTypeName(listPtr), startTime)
-		if err != nil {
-			return interpretListError(err, len(pred.Continue) > 0, continueKey, keyPrefix)
-		}
-		if err = s.validateMinimumResourceVersion(resourceVersion, uint64(getResp.Header.Revision)); err != nil {
-			return err
-		}
-		hasMore = getResp.More
-
-		if len(getResp.Kvs) == 0 && getResp.More {
-			return fmt.Errorf("no results were found, but etcd indicated there were more values remaining")
-		}
-
-		// avoid small allocations for the result slice, since this can be called in many
-		// different contexts and we don't know how significantly the result will be filtered
-		if pred.Empty() {
-			growSlice(v, len(getResp.Kvs))
-		} else {
-			growSlice(v, 2048, len(getResp.Kvs))
-		}
-
-		// take items from the response until the bucket is full, filtering as we go
-		for _, kv := range getResp.Kvs {
-			if paging && int64(v.Len()) >= pred.Limit {
-				hasMore = true
-				break
-			}
-			lastKey = kv.Key
-
-			data, _, err := s.transformer.TransformFromStorage(kv.Value, authenticatedDataString(kv.Key))
-			if err != nil {
-				return storage.NewInternalErrorf("unable to transform key %q: %v", kv.Key, err)
-			}
-
-			if err := appendListItem(v, data, uint64(kv.ModRevision), pred, s.codec, s.versioner, newItemFunc); err != nil {
-				return err
-			}
-		}
-
-		// indicate to the client which resource version was returned
-		if returnedRV == 0 {
-			returnedRV = getResp.Header.Revision
-		}
-
-		// no more results remain or we didn't request paging
-		if !hasMore || !paging {
-			break
-		}
-		// we're paging but we have filled our bucket
-		if int64(v.Len()) >= pred.Limit {
-			break
-		}
-		key = string(lastKey) + "\x00"
-		if withRev == 0 {
-			withRev = returnedRV
-			options = append(options, clientv3.WithRev(withRev))
-		}
+	hasMore, startKey, rv, remainingCnt, err := s.paginatedList(ctx, trace, key, rangeEnd, withRev, fromRV, v, getTypeName(listObj), opts.Predicate, newItemFunc)
+	if err != nil {
+		return interpretListError(err, len(pred.Continue) > 0, continueKey, keyPrefix)
 	}
 
 	// instruct the client to begin querying from immediately after the last key we returned
 	// we never return a key that the client wouldn't be allowed to see
 	if hasMore {
 		// we want to start immediately after the last key
-		next, err := encodeContinue(string(lastKey)+"\x00", keyPrefix, returnedRV)
+		next, err := encodeContinue(startKey, keyPrefix, rv)
 		if err != nil {
 			return err
 		}
@@ -800,15 +831,14 @@ func (s *store) List(ctx context.Context, key string, opts storage.ListOptions, 
 		// Only set remainingItemCount if the predicate is empty.
 		if utilfeature.DefaultFeatureGate.Enabled(features.RemainingItemCount) {
 			if pred.Empty() {
-				c := int64(getResp.Count - pred.Limit)
-				remainingItemCount = &c
+				remainingItemCount = &remainingCnt
 			}
 		}
-		return s.versioner.UpdateList(listObj, uint64(returnedRV), next, remainingItemCount)
+		return s.versioner.UpdateList(listObj, uint64(rv), next, remainingItemCount)
 	}
 
 	// no continuation
-	return s.versioner.UpdateList(listObj, uint64(returnedRV), "", nil)
+	return s.versioner.UpdateList(listObj, uint64(rv), "", nil)
 }
 
 // growSlice takes a slice value and grows its capacity up

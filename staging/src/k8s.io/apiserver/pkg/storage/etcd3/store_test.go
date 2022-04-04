@@ -57,7 +57,10 @@ import (
 var scheme = runtime.NewScheme()
 var codecs = serializer.NewCodecFactory(scheme)
 
-const defaultTestPrefix = "test!"
+const (
+	defaultTestPrefix       = "test!"
+	defaultListEtcdMaxLimit = 500
+)
 
 func init() {
 	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
@@ -1017,7 +1020,8 @@ func TestTransformationFailure(t *testing.T) {
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer cluster.Terminate(t)
-	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, false, NewDefaultLeaseManagerConfig())
+	pagingConfig := PagingConfig{PagingEnabled: false, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, NewDefaultLeaseManagerConfig(), pagingConfig)
 	ctx := context.Background()
 
 	preset := []struct {
@@ -1094,8 +1098,10 @@ func TestList(t *testing.T) {
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer cluster.Terminate(t)
-	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, NewDefaultLeaseManagerConfig())
-	disablePagingStore := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, false, NewDefaultLeaseManagerConfig())
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, NewDefaultLeaseManagerConfig(), pagingConfig)
+	disablePagingConfig := PagingConfig{PagingEnabled: false, MaximumPageSize: defaultListEtcdMaxLimit}
+	disablePagingStore := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, NewDefaultLeaseManagerConfig(), disablePagingConfig)
 	ctx := context.Background()
 
 	// Setup storage with the following structure:
@@ -1585,6 +1591,87 @@ func TestList(t *testing.T) {
 	}
 }
 
+func TestListPaginationWithEnforcedLimit(t *testing.T) {
+	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer cluster.Terminate(t)
+	etcdClient := cluster.RandClient()
+	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
+	transformer := &prefixTransformer{prefix: []byte(defaultTestPrefix)}
+	recorder := &clientRecorder{KV: etcdClient.KV}
+	etcdClient.KV = recorder
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(etcdClient, codec, newPod, "", transformer, NewDefaultLeaseManagerConfig(), pagingConfig)
+	ctx := context.Background()
+
+	// write 1000 pods
+	podCount := 1000
+	var pods []*example.Pod
+	for i := 0; i < podCount; i++ {
+		key := fmt.Sprintf("/one-level/pod-%d", i)
+		obj := &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod-%d", i)}}
+		storedObj := &example.Pod{}
+		err := store.Create(ctx, key, obj, storedObj, 0)
+		if err != nil {
+			t.Fatalf("Set failed: %v", err)
+		}
+		pods = append(pods, storedObj)
+	}
+
+	// user list requests with 100 limit + latest resource version
+	options := storage.ListOptions{
+		ResourceVersion: "0",
+		Predicate: storage.SelectionPredicate{
+			Limit: 100,
+			Label: labels.Everything(),
+			Field: fields.OneTermEqualSelector("metadata.name", "pod-999"),
+			GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
+				pod := obj.(*example.Pod)
+				return nil, fields.Set{"metadata.name": pod.Name}, nil
+			},
+		},
+	}
+
+	testCases := []struct {
+		// limit is the apiserver enforced list etcd page size limit
+		limit int
+		pages int
+	}{
+		{
+			limit: 1,
+			pages: 1000,
+		},
+		{
+			limit: 20,
+			pages: 50,
+		},
+		{
+			limit: 500, // use user specified 100 limit
+			pages: 10,
+		},
+	}
+	for _, tc := range testCases {
+		store.pagingConfig.MaximumPageSize = tc.limit
+		out := &example.PodList{}
+		if err := store.List(ctx, "/", options, out); err != nil {
+			t.Fatalf("Unable to get initial list: %v", err)
+		}
+		if len(out.Continue) != 0 {
+			t.Errorf("Unexpected continuation token set")
+		}
+		if len(out.Items) != 1 || !reflect.DeepEqual(&out.Items[0], pods[999]) {
+			t.Fatalf("Unexpected first page: %#v", out.Items)
+		}
+		if transformer.reads != uint64(podCount) {
+			t.Errorf("unexpected reads: %d", transformer.reads)
+		}
+		if int(recorder.reads) != tc.pages {
+			t.Errorf("expect reads: %d, but got %d", tc.pages, recorder.reads)
+		}
+		transformer.resetReads()
+		recorder.resetReads()
+	}
+}
+
 func TestListContinuation(t *testing.T) {
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
@@ -1593,7 +1680,8 @@ func TestListContinuation(t *testing.T) {
 	etcdClient := cluster.RandClient()
 	recorder := &clientRecorder{KV: etcdClient.KV}
 	etcdClient.KV = recorder
-	store := newStore(etcdClient, codec, newPod, "", transformer, true, NewDefaultLeaseManagerConfig())
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(etcdClient, codec, newPod, "", transformer, NewDefaultLeaseManagerConfig(), pagingConfig)
 	ctx := context.Background()
 
 	// Setup storage with the following structure:
@@ -1755,7 +1843,8 @@ func TestListContinuationWithFilter(t *testing.T) {
 	etcdClient := cluster.RandClient()
 	recorder := &clientRecorder{KV: etcdClient.KV}
 	etcdClient.KV = recorder
-	store := newStore(etcdClient, codec, newPod, "", transformer, true, NewDefaultLeaseManagerConfig())
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(etcdClient, codec, newPod, "", transformer, NewDefaultLeaseManagerConfig(), pagingConfig)
 	ctx := context.Background()
 
 	preset := []struct {
@@ -1858,7 +1947,8 @@ func TestListInconsistentContinuation(t *testing.T) {
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
 	defer cluster.Terminate(t)
-	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, NewDefaultLeaseManagerConfig())
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, NewDefaultLeaseManagerConfig(), pagingConfig)
 	ctx := context.Background()
 
 	// Setup storage with the following structure:
@@ -2006,10 +2096,11 @@ func testSetup(t *testing.T) (context.Context, *store, *integration.ClusterV3) {
 	// As 30s is the default timeout for testing in glboal configuration,
 	// we cannot wait longer than that in a single time: change it to 10
 	// for testing purposes. See apimachinery/pkg/util/wait/wait.go
-	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, LeaseManagerConfig{
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, LeaseManagerConfig{
 		ReuseDurationSeconds: 1,
 		MaxObjectCount:       defaultLeaseMaxObjectCount,
-	})
+	}, pagingConfig)
 	ctx := context.Background()
 	return ctx, store, cluster
 }
@@ -2050,8 +2141,9 @@ func TestPrefix(t *testing.T) {
 		"/custom//prefix//": "/custom/prefix",
 		"/registry":         "/registry",
 	}
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
 	for configuredPrefix, effectivePrefix := range testcases {
-		store := newStore(cluster.RandClient(), codec, nil, configuredPrefix, transformer, true, NewDefaultLeaseManagerConfig())
+		store := newStore(cluster.RandClient(), codec, nil, configuredPrefix, transformer, NewDefaultLeaseManagerConfig(), pagingConfig)
 		if store.pathPrefix != effectivePrefix {
 			t.Errorf("configured prefix of %s, expected effective prefix of %s, got %s", configuredPrefix, effectivePrefix, store.pathPrefix)
 		}
@@ -2217,7 +2309,8 @@ func TestConsistentList(t *testing.T) {
 	transformer := &fancyTransformer{
 		transformer: &prefixTransformer{prefix: []byte(defaultTestPrefix)},
 	}
-	store := newStore(cluster.RandClient(), codec, newPod, "", transformer, true, NewDefaultLeaseManagerConfig())
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(cluster.RandClient(), codec, newPod, "", transformer, NewDefaultLeaseManagerConfig(), pagingConfig)
 	transformer.store = store
 
 	for i := 0; i < 5; i++ {
@@ -2322,10 +2415,11 @@ func TestCount(t *testing.T) {
 func TestLeaseMaxObjectCount(t *testing.T) {
 	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
 	cluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
-	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, true, LeaseManagerConfig{
+	pagingConfig := PagingConfig{PagingEnabled: true, MaximumPageSize: defaultListEtcdMaxLimit}
+	store := newStore(cluster.RandClient(), codec, newPod, "", &prefixTransformer{prefix: []byte(defaultTestPrefix)}, LeaseManagerConfig{
 		ReuseDurationSeconds: defaultLeaseReuseDurationSeconds,
 		MaxObjectCount:       2,
-	})
+	}, pagingConfig)
 	ctx := context.Background()
 	defer cluster.Terminate(t)
 
