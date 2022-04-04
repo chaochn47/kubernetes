@@ -79,6 +79,8 @@ type Config struct {
 	// HealthcheckTimeout specifies the timeout used when checking health
 	HealthcheckTimeout time.Duration
 
+	MaximumListEtcdLimit int
+
 	LeaseManagerConfig etcd3.LeaseManagerConfig
 }
 

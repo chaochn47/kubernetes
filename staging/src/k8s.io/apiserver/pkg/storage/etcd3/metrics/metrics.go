@@ -85,6 +85,24 @@ var (
 		},
 		[]string{},
 	)
+	listStorageLatency = compbasemetrics.NewHistogramVec(
+		&compbasemetrics.HistogramOpts{
+			Name:           "apiserver_storage_list_duration_seconds",
+			Help:           "Duration of objects returned for a LIST request from storage",
+			Buckets:        []float64{0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 15.0, 30.0, 60.0},
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"type"},
+	)
+	listStorageWithMultiplePagesLatency = compbasemetrics.NewHistogramVec(
+		&compbasemetrics.HistogramOpts{
+			Name:           "apiserver_storage_splitted_list_duration_seconds",
+			Help:           "Duration of objects returned for a splitted LIST request from storage",
+			Buckets:        []float64{0.005, 0.025, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 15.0, 30.0, 60.0},
+			StabilityLevel: compbasemetrics.ALPHA,
+		},
+		[]string{"type"},
+	)
 )
 
 var registerMetrics sync.Once
@@ -99,6 +117,8 @@ func Register() {
 		legacyregistry.MustRegister(dbTotalSize)
 		legacyregistry.MustRegister(etcdBookmarkCounts)
 		legacyregistry.MustRegister(etcdLeaseObjectCounts)
+		legacyregistry.MustRegister(listStorageLatency)
+		legacyregistry.MustRegister(listStorageWithMultiplePagesLatency)
 	})
 }
 
@@ -111,6 +131,16 @@ func UpdateObjectCount(resourcePrefix string, count int64) {
 // RecordEtcdRequestLatency sets the etcd_request_duration_seconds metrics.
 func RecordEtcdRequestLatency(verb, resource string, startTime time.Time) {
 	etcdRequestLatency.WithLabelValues(verb, resource).Observe(sinceInSeconds(startTime))
+}
+
+// RecordListStorageLatency sets the "apiserver_storage_list_duration_seconds"
+// and "apiserver_storage_splitted_list_duration_seconds" metrics.
+func RecordListStorageLatency(typename string, pages int, startTime time.Time) {
+	took := sinceInSeconds(startTime)
+	listStorageLatency.WithLabelValues(typename).Observe(took)
+	if pages > 1 {
+		listStorageWithMultiplePagesLatency.WithLabelValues(typename).Observe(took)
+	}
 }
 
 // RecordEtcdBookmark updates the etcd_bookmark_counts metric.

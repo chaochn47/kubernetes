@@ -61,6 +61,7 @@ var (
 const (
 	// watchCacheDefaultCapacity syncs watch cache defaultLowerBoundCapacity.
 	watchCacheDefaultCapacity = 100
+	defaultListEtcdMaxLimit = 500
 )
 
 func init() {
@@ -105,7 +106,7 @@ func newPodList() runtime.Object { return &example.PodList{} }
 
 func newEtcdTestStorage(t *testing.T, prefix string) (*etcd3testing.EtcdTestServer, storage.Interface) {
 	server, _ := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
-	storage := etcd3.New(server.V3Client, apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion), newPod, prefix, value.IdentityTransformer, true, etcd3.NewDefaultLeaseManagerConfig())
+	storage := etcd3.New(server.V3Client, apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion), newPod, prefix, value.IdentityTransformer, true, etcd3.NewDefaultLeaseManagerConfig(), defaultListEtcdMaxLimit)
 	return server, storage
 }
 
