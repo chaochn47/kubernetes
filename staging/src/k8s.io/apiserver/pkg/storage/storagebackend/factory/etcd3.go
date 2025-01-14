@@ -285,9 +285,10 @@ func (t *etcd3ProberMonitor) Monitor(ctx context.Context) (metrics.StorageMetric
 
 var newETCD3Client = func(c storagebackend.TransportConfig) (*kubernetes.Client, error) {
 	tlsInfo := transport.TLSInfo{
-		CertFile:      c.CertFile,
-		KeyFile:       c.KeyFile,
-		TrustedCAFile: c.TrustedCAFile,
+		CertFile:           c.CertFile,
+		KeyFile:            c.KeyFile,
+		TrustedCAFile:      c.TrustedCAFile,
+		InsecureSkipVerify: c.InsecureSkipVerify,
 	}
 	tlsConfig, err := tlsInfo.ClientConfig()
 	if err != nil {
@@ -295,9 +296,10 @@ var newETCD3Client = func(c storagebackend.TransportConfig) (*kubernetes.Client,
 	}
 	// NOTE: Client relies on nil tlsConfig
 	// for non-secure connections, update the implicit variable
-	if len(c.CertFile) == 0 && len(c.KeyFile) == 0 && len(c.TrustedCAFile) == 0 {
+	if len(c.CertFile) == 0 && len(c.KeyFile) == 0 && len(c.TrustedCAFile) == 0 && !c.InsecureSkipVerify {
 		tlsConfig = nil
 	}
+
 	networkContext := egressselector.Etcd.AsNetworkContext()
 	var egressDialer utilnet.DialFunc
 	if c.EgressLookup != nil {

@@ -179,6 +179,9 @@ func (s *EtcdOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringSliceVar(&s.StorageConfig.Transport.ServerList, "etcd-servers", s.StorageConfig.Transport.ServerList,
 		"List of etcd servers to connect with (scheme://ip:port), comma separated.")
 
+	fs.BoolVar(&s.StorageConfig.Transport.InsecureSkipVerify, "etcd-insecure-skip-verify", true, ""+
+		"Enables etcd client to skip server certificate identity validation")
+
 	fs.StringVar(&s.StorageConfig.Prefix, "etcd-prefix", s.StorageConfig.Prefix,
 		"The prefix to prepend to all resource paths in etcd.")
 

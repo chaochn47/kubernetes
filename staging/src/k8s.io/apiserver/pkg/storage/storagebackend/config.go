@@ -50,6 +50,8 @@ type TransportConfig struct {
 	KeyFile       string
 	CertFile      string
 	TrustedCAFile string
+	// Skip server cert validation
+	InsecureSkipVerify bool
 	// function to determine the egress dialer. (i.e. konnectivity server dialer)
 	EgressLookup egressselector.Lookup
 	// The TracerProvider can add tracing the connection

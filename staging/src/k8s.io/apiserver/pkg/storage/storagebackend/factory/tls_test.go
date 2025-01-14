@@ -18,14 +18,14 @@ package factory
 
 import (
 	"context"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"testing"
-
-	"go.etcd.io/etcd/client/pkg/v3/transport"
-	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
+	"time"
 
 	apitesting "k8s.io/apimachinery/pkg/api/apitesting"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,6 +47,61 @@ func init() {
 	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
 	utilruntime.Must(example.AddToScheme(scheme))
 	utilruntime.Must(examplev1.AddToScheme(scheme))
+}
+
+func TestTLSConnectionByAutoTLS(t *testing.T) {
+	codec := apitesting.TestCodec(codecs, examplev1.SchemeGroupVersion)
+
+	certFile, keyFile, caFile := configureTLSCerts(t)
+	defer os.RemoveAll(filepath.Dir(certFile))
+
+	// override server config to be TLS-enabled
+	etcdConfig := testserver.NewTestConfig(t)
+	etcdConfig.ClientTLSInfo = transport.TLSInfo{
+		CertFile:           certFile,
+		KeyFile:            keyFile,
+		TrustedCAFile:      caFile,
+		InsecureSkipVerify: true,
+	}
+	etcdConfig.ClientAutoTLS = true
+	etcdConfig.SelfSignedCertValidity = 1
+
+	for i := range etcdConfig.ListenClientUrls {
+		etcdConfig.ListenClientUrls[i].Scheme = "https"
+	}
+	for i := range etcdConfig.AdvertiseClientUrls {
+		etcdConfig.AdvertiseClientUrls[i].Scheme = "https"
+	}
+
+	client := testserver.RunEtcd(t, etcdConfig)
+	cfg := storagebackend.Config{
+		Type: storagebackend.StorageTypeETCD3,
+		Transport: storagebackend.TransportConfig{
+			ServerList:         client.Endpoints(),
+			CertFile:           certFile,
+			KeyFile:            keyFile,
+			TrustedCAFile:      caFile,
+			InsecureSkipVerify: true,
+			TracerProvider:     noopoteltrace.NewTracerProvider(),
+		},
+		Codec: codec,
+	}
+	storage, destroyFunc, err := newETCD3Storage(*cfg.ForResource(schema.GroupResource{Resource: "pods"}), nil, nil, "")
+	defer destroyFunc()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// give some time for the feature support checker go routine to be scheduled and perform the version comparison.
+	// Note: this is not a guarantee and just a hack to confirm my understanding of why
+	// removing this wait time would cause the following error
+	// E0114 12:37:28.268040   56649 feature_support_checker.go:118] "Failed to check if RequestWatchProgress is supported by etcd after retrying" err="context canceled"
+	// W0114 12:37:28.268069   56649 logging.go:55] [core] [Channel #13 SubChannel #14]grpc: addrConn.createTransport failed to connect to {Addr: "localhost:36561", ServerName: "localhost:36561", }. Err: connection error: desc = "transport: authentication handshake failed: context canceled"
+	time.Sleep(100 * time.Millisecond)
+	err = storage.Create(context.TODO(), "/abc", &example.Pod{}, nil, 0)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
 }
 
 func TestTLSConnection(t *testing.T) {
