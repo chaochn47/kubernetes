@@ -238,7 +238,9 @@ func (c *threadSafeMap) Update(key string, obj interface{}) {
 	defer c.lock.Unlock()
 	oldObject := c.items[key]
 	c.items[key] = obj
-	c.index.updateIndices(oldObject, obj, key)
+	if c.index != nil {
+		c.index.updateIndices(oldObject, obj, key)
+	}
 }
 
 func (c *threadSafeMap) Delete(key string) {

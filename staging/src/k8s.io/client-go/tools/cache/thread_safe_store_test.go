@@ -19,7 +19,10 @@ package cache
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
@@ -192,4 +195,81 @@ func BenchmarkIndexer(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		store.Update(objects[i%objectCount], objects[i%objectCount])
 	}
+}
+
+func BenchmarkIndexerWithConcurrentReadWrite(b *testing.B) {
+	testIndexer := "testIndexer"
+
+	indexers := Indexers{
+		testIndexer: func(obj interface{}) (strings []string, e error) {
+			indexes := []string{obj.(string)}
+			return indexes, nil
+		},
+	}
+
+	indices := Indices{}
+	store := NewThreadSafeStore(indexers, indices).(*threadSafeMap)
+	//store := threadSafeMap{items: map[string]interface{}{}}
+
+	// Pre-populate store with 70k objects
+	for i := 0; i < 70000; i++ {
+		obj := fmt.Sprintf("initial-object-%d", i)
+		store.Update(obj, obj)
+	}
+
+	// Create a WaitGroup to synchronize goroutines
+	var wg sync.WaitGroup
+
+	// Create a channel to signal completion
+	done := make(chan struct{})
+
+	// Add counters for read operations
+	readOps := uint64(0)
+
+	b.ResetTimer()
+
+	// Start 5 reader goroutines
+	for r := 0; r < 5; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					store.List()                  // Continuous reading
+					atomic.AddUint64(&readOps, 1) // Count read operations
+				}
+			}
+		}()
+	}
+
+	startTime := time.Now()
+	writeOps := 0
+
+	// Benchmark the writer
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			obj := fmt.Sprintf("new-object-%d", i%800000)
+			store.Update(obj, obj)
+			writeOps++
+			i++
+		}
+	})
+
+	elapsed := time.Since(startTime)
+
+	// Signal readers to stop and wait for completion
+	close(done)
+	wg.Wait()
+
+	// Report throughput metrics
+	totalReads := atomic.LoadUint64(&readOps)
+	readThroughput := float64(totalReads) / elapsed.Seconds()
+	writeThroughput := float64(writeOps) / elapsed.Seconds()
+
+	b.ReportMetric(readThroughput, "reads/sec")
+	b.ReportMetric(writeThroughput, "writes/sec")
 }
